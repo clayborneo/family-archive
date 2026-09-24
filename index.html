@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; connect-src 'self' https://pub-9fe76174f3534270a6b054fbb2b73793.r2.dev; font-src 'self'; img-src blob: data:; style-src 'unsafe-inline'; script-src 'sha256-aTjfh1t9V4WHkos0uvxZBZ1CXLTsjcyGGMJ/oxYdAtQ=' 'sha256-vh4qinURti28R9wPSxT05GAygwpUbP1CUPOJSYNAJl0='; base-uri 'none'; object-src 'none'; form-action 'none'">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow, noarchive">
+<meta name="referrer" content="no-referrer">
+<title>Family archive</title>
+<style>
+  html, body { margin: 0; min-height: 100%; }
+  #gate { min-height: 100vh; display: grid; place-items: center; background: #f2e9d6; color: #2b2219; font: 18px/1.5 Georgia, "Times New Roman", serif; padding: 24px; box-sizing: border-box; }
+  #gate form { max-width: 380px; width: 100%; text-align: center; }
+  #gate h1 { font-weight: 500; font-size: 30px; margin: 0 0 6px; color: #2f4a3b; }
+  #gate p { margin: 0 0 22px; color: #5c4f40; }
+  #gate input { width: 100%; box-sizing: border-box; font: inherit; padding: 12px 14px; border: 1px solid #cdbd9c; background: #fdfbf5; border-radius: 2px; text-align: center; }
+  #gate button { margin-top: 12px; width: 100%; font: 600 14px/1 "Gill Sans", "Trebuchet MS", sans-serif; letter-spacing: .12em; text-transform: uppercase; color: #fbf6ea; background: #9a4a2b; border: 0; padding: 14px; border-radius: 2px; cursor: pointer; }
+  #gate button[disabled] { opacity: .6; cursor: progress; }
+  #msg { min-height: 1.5em; margin-top: 14px; font-size: 15px; color: #9a4a2b; }
+</style>
+</head>
+<body>
+<div id="gate"><form id="f" autocomplete="off">
+  <h1>Family archive</h1>
+  <p>This is private. If someone in the family sent you here, they gave you a passphrase.</p>
+  <input id="pw" type="password" aria-label="Passphrase" placeholder="passphrase" autofocus>
+  <button id="go" type="submit">Open</button>
+  <div id="msg" role="status"></div>
+</form></div>
+<div id="app" hidden></div>
+<script>
+(function () {
+  "use strict";
+  var V = "bd201a0990", ITER = 600000, key = null, bundle = null, route = "index.html", busy = false, storeKey = null;
+  var media = new Map(), gate = document.getElementById("gate"), app = document.getElementById("app"), msg = document.getElementById("msg");
+  var BASE = new URL(".", location.href).href;          /* site.enc is fetched from the shell's own folder ... */
+  var MEDIA = "https://pub-9fe76174f3534270a6b054fbb2b73793.r2.dev/all/";                               /* ... and the sealed pictures from the R2 bucket (seal/r2.env) */
+  var enc = new TextEncoder();
+  var b64 = { enc: function (buf) { return btoa(String.fromCharCode.apply(null, new Uint8Array(buf))); },
+              dec: function (s) { return Uint8Array.from(atob(s), function (c) { return c.charCodeAt(0); }); } };
+
+  function importKey(raw) { return crypto.subtle.importKey("raw", raw, "AES-GCM", false, ["decrypt"]); }   /* not extractable */
+  function derive(pw, salt) {
+    return crypto.subtle.importKey("raw", enc.encode(pw), "PBKDF2", false, ["deriveBits"])
+      .then(function (k) { return crypto.subtle.deriveBits({ name: "PBKDF2", salt: salt, iterations: ITER, hash: "SHA-256" }, k, 256); });
+  }
+  function open_(k, buf, at, label) {   /* iv(12) | ciphertext+tag from `at`. The label is bound in, so files cannot be swapped. */
+    return crypto.subtle.decrypt({ name: "AES-GCM", iv: buf.slice(at, at + 12), additionalData: enc.encode(label) }, k, buf.slice(at + 12));
+  }
+  function fetchBuf(path, base) {
+    return fetch((base || BASE) + path + "?v=" + V, { cache: "no-store", referrerPolicy: "no-referrer" })
+      .then(function (r) { if (!r.ok) throw new Error("missing " + path); return r.arrayBuffer(); });
+  }
+  var sitePromise = null;
+  function getSite() {                  /* a failed download is forgotten, so "try again" really tries again */
+    if (!sitePromise) sitePromise = fetchBuf("site.enc").catch(function (e) { sitePromise = null; throw e; });
+    return sitePromise;
+  }
+
+  var ctx = {
+    data: function (name) { return Promise.resolve(bundle.data[name] || []); },
+    href: function (r) { return "#/" + r; },
+    media: function (name) {
+      var id = bundle.media[name];
+      if (!id) return Promise.reject(new Error("unknown picture"));
+      if (!media.has(name)) media.set(name, fetchBuf("m/" + id + ".enc", MEDIA)
+        .then(function (buf) { return open_(key, buf, 0, id); })
+        .then(function (plain) { return URL.createObjectURL(new Blob([plain], { type: "image/jpeg" })); })
+        .catch(function (e) { media.delete(name); throw e; }));
+      return media.get(name);
+    }
+  };
+
+  var seen = null;
+  function watch() {
+    if (seen) seen.disconnect();
+    seen = new IntersectionObserver(function (entries) {
+      entries.forEach(function (e) {
+        if (!e.isIntersecting) return;
+        seen.unobserve(e.target);
+        window.TA.setImg(e.target, e.target.dataset.m, ctx);
+      });
+    }, { rootMargin: "700px" });
+    app.querySelectorAll("img[data-m]:not([data-claimed])").forEach(function (img) { seen.observe(img); });
+  }
+
+  function resolve(href) { return new URL(href, "https://x/" + route).pathname.slice(1) || "index.html"; }
+  function render() {
+    if (!bundle.pages[route]) route = "index.html";
+    var doc = new DOMParser().parseFromString(bundle.pages[route], "text/html");   /* pictures were made inert when sealed */
+    doc.querySelectorAll("script, link, iframe, object, embed, form, base, meta").forEach(function (n) { n.remove(); });
+    doc.querySelectorAll("a[href]").forEach(function (a) {   /* real hash links: middle-click and copy-link never ask the server for a name */
+      var h = a.getAttribute("href");
+      if (/^(https?:|mailto:)/.test(h)) { a.rel = "noopener noreferrer"; return; }
+      var r = h.charAt(0) === "#" ? null : resolve(h);
+      a.setAttribute("href", r && bundle.pages[r] ? "#/" + r : "#/" + route);
+    });
+    /* pictures the page script chooses for itself (today's pick) are kept away from the lazy loader */
+    ["feat-img", "who-img"].forEach(function (id) { var el = doc.getElementById(id); if (el) el.dataset.claimed = "1"; });
+    document.title = doc.title;
+    app.innerHTML = doc.body.innerHTML;
+
+    var p = document.createElement("p"); p.style.cssText = "text-align:center;padding:0 0 34px;margin:0";
+    var lb = document.createElement("button"); lb.className = "chip"; lb.textContent = "Lock the archive on this device";
+    lb.addEventListener("click", function () {
+      try { sessionStorage.removeItem(storeKey); } catch (e) {}
+      media.forEach(function (pr) { pr.then(function (u) { URL.revokeObjectURL(u); }).catch(function () {}); });
+      location.replace(BASE);
+    });
+    p.appendChild(lb); app.appendChild(p);
+
+    window.scrollTo(0, 0);
+    watch();
+    ["feat-img", "who-img"].forEach(function (id) { var el = document.getElementById(id); if (el) window.TA.setImg(el, el.dataset.m, ctx); });
+    window.TA.init(ctx);
+  }
+  function routeFromHash() { try { return decodeURIComponent(location.hash.replace(/^#\//, "")) || "index.html"; } catch (e) { return "index.html"; } }
+  window.addEventListener("hashchange", function () { if (bundle) { route = routeFromHash(); render(); } });
+
+  function start(rawKey, buf) {
+    return importKey(rawKey)
+      .then(function (k) { return open_(k, buf, 16, "site").then(function (plain) { key = k; return plain; }); })
+      .then(function (gz) {       /* the bundle is gzipped before it is sealed */
+        return new Response(new Blob([gz]).stream().pipeThrough(new DecompressionStream("gzip"))).text();
+      })
+      .then(function (text) {
+        try {
+          bundle = JSON.parse(text);
+          /* Staying open across a reload is a convenience chosen on purpose. The cost: until the tab closes or Lock is
+             pressed, this tab holds the key, and every site on this same web origin could read it from this tab. */
+          try { sessionStorage.setItem(storeKey, b64.enc(rawKey)); } catch (e) {}
+          var st = document.createElement("style"); st.textContent = bundle.css; document.head.appendChild(st);
+          window.TA_SEALED = true;
+          var sc = document.createElement("script"); sc.textContent = bundle.js; document.head.appendChild(sc);
+          gate.remove(); app.hidden = false;
+          route = routeFromHash();
+          render();
+        } catch (err) { console.error(err); bundle = null; var e2 = new Error("render"); e2.render = true; throw e2; }
+      });
+  }
+
+  function unlock(getRaw) {
+    if (busy || bundle) return Promise.resolve();
+    busy = true;
+    return getSite().then(function (buf) {
+      storeKey = "ta:k:" + b64.enc(buf.slice(0, 6));      /* one saved key per archive and per build */
+      return getRaw(buf).then(function (raw) { return raw ? start(raw, buf) : null; });
+    }).then(function (v) { busy = false; return v; }, function (e) { busy = false; throw e; });
+  }
+
+  unlock(function () {
+    var saved = null; try { saved = sessionStorage.getItem(storeKey); } catch (e) {}
+    return Promise.resolve(saved ? b64.dec(saved).buffer : null);
+  }).catch(function () { try { sessionStorage.removeItem(storeKey); } catch (e) {} });
+
+  document.getElementById("f").addEventListener("submit", function (e) {
+    e.preventDefault();
+    var btn = document.getElementById("go"), pw = document.getElementById("pw").value;
+    if (!pw || busy) return;
+    btn.disabled = true; msg.textContent = "Opening…";
+    unlock(function (buf) { return derive(pw, buf.slice(0, 16)); }).catch(function (err) {
+      btn.disabled = false;
+      msg.textContent = err && err.render ? "It opened, but something went wrong showing it. Please tell whoever sent you here."
+        : /missing|Failed to fetch|NetworkError|Load failed/i.test(String(err)) ? "The archive could not be downloaded. Check the connection and try again."
+        : "That passphrase did not open it.";
+    });
+  });
+})();
+</script>
+</body>
+</html>
